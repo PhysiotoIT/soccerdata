@@ -115,7 +115,10 @@ source.
   Go to https://api.sofascore.com/api/v1/config/unique-tournaments/EN/football
   to get the list of major leagues and tournaments. Access ``uniqueTournaments``
   in the JSON response, and the ``{league name}`` corresponds to the ``name``
-  field.
+  field. Leagues that are not in that list can be added with their numeric
+  unique-tournament ID instead of the name, e.g. ``"Sofascore": 202`` for the
+  Polish Ekstraklasa. The ID is the number at the end of the league's URL on
+  sofascore.com.
 
 Troubleshooting
 ---------------
