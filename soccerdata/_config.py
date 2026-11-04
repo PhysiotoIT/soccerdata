@@ -161,6 +161,13 @@ LEAGUE_DICT = {
         "season_start": "Aug",
         "season_end": "May",
     },
+    "POL-Ekstraklasa": {
+        # Ekstraklasa is not in Sofascore's list of default tournaments, so it is
+        # referenced by its unique-tournament ID instead of by name.
+        "Sofascore": 202,
+        "season_start": "Jul",
+        "season_end": "May",
+    },
     "INT-World Cup": {
         "FBref": "FIFA World Cup",
         "WhoScored": "International - FIFA World Cup",

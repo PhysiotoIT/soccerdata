@@ -149,12 +149,16 @@ testpaths = ["tests"]
 src = ["soccerdata", "tests"]
 line-length = 99
 target-version = "py310"
+# copied from the analityk-meczowy skill script (plus the v2 "rynki" key); keeps its own style
+extend-exclude = ["analityk/model_meczowy.py"]
 
 [tool.ruff.lint]
 ignore = ["B904"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
+"analityk/*" = ["T201", "D", "INP001", "PLR", "C901"]
+"analityk/tests/*" = ["S", "D", "INP001", "E402", "SLF001", "SIM113"]
 "tests/*" = [
   "S",
   "D212",
