@@ -6,9 +6,12 @@ z `LEAGUE_DICT`) przez ten fork soccerdata i budują `mecz.json` dla `model_mecz
 ## Instalacja
 
 ```bash
-git clone --depth 1 https://github.com/PhysiotoIT/soccerdata
-pip install -e soccerdata          # w sandboxie Claude: pip install --break-system-packages -e soccerdata
+git clone --depth 1 https://github.com/PhysiotoIT/soccerdata soccerdata-fork
+pip install -e soccerdata-fork     # w sandboxie Claude: pip install --break-system-packages -e soccerdata-fork
 ```
+
+Katalog `soccerdata-fork`, a nie `soccerdata`: `~/soccerdata` to domyślne miejsce na dane
+i konfigurację biblioteki.
 
 Dane idą z `api.sofascore.com`. W sandboxie Claude ta domena musi być na liście dozwolonych
 (Ustawienia > Capabilities); na własnym komputerze działa od razu. Pobrane mecze są
@@ -21,6 +24,7 @@ python3 analityk/buduj_mecz.py --lista "Lech"                    # najbliższe m
 python3 analityk/buduj_mecz.py "Lech" "Legia" --wyjscie mecz.json
 python3 analityk/buduj_mecz.py "Lech" "Legia" --poprzedni-sezon   # mała próba, start sezonu
 python3 analityk/model_meczowy.py mecz.json
+python3 analityk/kalibracja.py log.csv                          # trafność typów, także bez kursów
 ```
 
 Nazwy drużyn wystarczą skrócone, bez polskich znaków. Jeśli kolejność jest odwrotna niż

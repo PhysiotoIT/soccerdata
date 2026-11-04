@@ -149,7 +149,7 @@ testpaths = ["tests"]
 src = ["soccerdata", "tests"]
 line-length = 99
 target-version = "py310"
-# copied byte-for-byte from the analityk-meczowy skill; keep it identical to the skill's script
+# copied from the analityk-meczowy skill script (plus the v2 "rynki" key); keeps its own style
 extend-exclude = ["analityk/model_meczowy.py"]
 
 [tool.ruff.lint]

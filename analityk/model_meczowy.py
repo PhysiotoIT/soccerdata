@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Model meczowy: Dixon-Coles + rynki pochodne + statystyki (NB) + EV po polskim podatku.
+(Kopia skryptu ze skilla analityk-meczowy; v2 dodaje klucz "rynki": rynki do tabeli bez kursów.)
   python3 model_meczowy.py mecz.json            analiza meczu
   python3 model_meczowy.py --log log.csv        rozliczenie: ROI, CLV, Brier, kalibracja
   python3 model_meczowy.py --normal MU SIGMA L  szybki rozkład normalny (np. NBA: suma, handicap)"""
@@ -243,7 +244,8 @@ def main(cfg):
     for z in cfg.get("zawodnicy", []):
         rynki += [f"{z['nazwa']} Over {L:g}" for L in z.get("linie", [0.5, 1.5])]
     kursy = cfg.get("kursy", {})
-    rynki += [k for k in kursy if k not in rynki]
+    # v2: "rynki" = dodatkowe rynki do tabeli P bez kursów (np. "Wynik 2:1", "1 & Over 1.5")
+    rynki += [k for k in list(cfg.get("rynki", [])) + list(kursy) if k not in rynki]
 
     wiersze = []
     for r in rynki:

@@ -166,6 +166,7 @@ def test_zbuduj_bez_przecieku_i_z_modelem(tmp_path: Path) -> None:
     assert wynik["mecz"].startswith("Lech Poznań – Legia Warszawa, POL-Ekstraklasa, 01.09")
     assert {"Rożne", "Strzały", "Strzały celne", "Faule", "Kartki"} <= set(wynik["statystyki"])
 
+    wynik["rynki"] = ["Wynik 2:1", "1 & Over 1.5"]
     plik = tmp_path / "mecz.json"
     plik.write_text(json.dumps(wynik, ensure_ascii=False, default=str), encoding="utf-8")
     out = subprocess.run(
@@ -177,6 +178,7 @@ def test_zbuduj_bez_przecieku_i_z_modelem(tmp_path: Path) -> None:
     assert "λ model" in out
     assert "Rożne Over" in out
     assert "Kartki" in out
+    assert "Wynik 2:1" in out and "1 & Over 1.5" in out  # dodatkowe rynki bez kursów
     assert "VALUE" not in out  # bez kursów nie ma sekcji value
 
 
@@ -219,3 +221,27 @@ def test_ciekawostki_i_forma() -> None:
     assert any(x.startswith("W tym sezonie: Lech Poznań u siebie 4:0") for x in c)
     f = bm.forma(df, "Lech Poznań")
     assert len(f) == 5 and all("xG" in x for x in f)
+
+
+def test_kalibracja_bez_kursow(tmp_path: Path) -> None:
+    import kalibracja
+
+    log = tmp_path / "log.csv"
+    log.write_text(
+        "data,mecz,rynek,p_model,kurs_wziety,kurs_zamkniecia,stawka,podatek,wynik\n"
+        "2026-11-01,A – B,Over 1.5,0.80,,,,,1\n"
+        "2026-11-01,A – B,BTTS tak,0.60,,,,,0\n"
+        "2026-11-02,C – D,1,0.50,2.10,2.00,10,0.88,1\n"
+        "2026-11-02,C – D,Rożne Over 8.5,0.65,,,,,Z\n"
+        "2026-11-03,E – F,Under 3.5,0.70,,,,,\n",
+        encoding="utf-8",
+    )
+    import csv as _csv
+
+    with log.open(encoding="utf-8") as fh:
+        w = kalibracja.rozlicz(list(_csv.DictReader(fh)))
+    assert w["n"] == 3  # zwrot i nierozliczony pominięte
+    assert w["brier"] == pytest.approx((0.2**2 + 0.6**2 + 0.5**2) / 3)
+    assert w["roi"] == pytest.approx(0.88 * 2.10 - 1)
+    assert w["clv"] == pytest.approx(2.10 / 2.00 - 1)
+    kalibracja.main([str(log)])
