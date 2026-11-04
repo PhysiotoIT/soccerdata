@@ -245,7 +245,9 @@ def main(cfg):
         rynki += [f"{z['nazwa']} Over {L:g}" for L in z.get("linie", [0.5, 1.5])]
     kursy = cfg.get("kursy", {})
     # v2: "rynki" = dodatkowe rynki do tabeli P bez kursów (np. "Wynik 2:1", "1 & Over 1.5")
-    rynki += [k for k in list(cfg.get("rynki", [])) + list(kursy) if k not in rynki]
+    rynki += list(cfg.get("rynki", [])) + list(kursy)
+    widziane = set()
+    rynki = [r for r in rynki if not (norm(r) in widziane or widziane.add(norm(r)))]
 
     wiersze = []
     for r in rynki:

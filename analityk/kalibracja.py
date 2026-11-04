@@ -4,9 +4,10 @@
   python3 analityk/kalibracja.py log.csv
 
 Kolumny jak w skillu: data,mecz,rynek,p_model,kurs_wziety,kurs_zamkniecia,stawka,podatek,wynik
-(wynik: 1, 0, Z = zwrot; puste = nierozliczony). Kursy i stawka mogą być puste: wtedy liczą się
-tylko trafność modelu (Brier, log loss, kalibracja w przedziałach P). ROI i CLV — tylko dla
-wierszy z kursem i stawką.
+(wynik: 1/W/tak = trafiony, 0/P/nie = nietrafiony, Z = zwrot; puste = nierozliczony; p_model
+jako 0.82, 0,82 albo 82%). Separator przecinek albo średnik (polski Excel). Kursy i stawka mogą
+być puste: wtedy liczy się tylko trafność modelu (Brier, log loss, kalibracja w przedziałach P).
+ROI i CLV — tylko dla wierszy z kursem i stawką.
 """
 
 from __future__ import annotations
@@ -15,21 +16,57 @@ import csv
 import math
 import sys
 
+TRAFIONY = {"1", "W", "T", "TAK", "Y", "YES", "WIN", "WYGRANY", "TRAFIONY"}
+NIETRAFIONY = {"0", "P", "N", "NIE", "NO", "LOSS", "PRZEGRANY", "NIETRAFIONY"}
+ZWROT = {"Z", "ZWROT", "PUSH", "VOID"}
+
 
 def _liczba(x: str | None) -> float | None:
     x = (x or "").strip().replace(",", ".")
     return float(x) if x else None
 
 
+def _p(x: str | None) -> float | None:
+    """P modelu: 0.82, 0,82, 82% albo 82 -> 0.82."""
+    procent = "%" in (x or "")
+    p = _liczba((x or "").replace("%", ""))
+    if p is not None and (procent or p > 1):
+        p /= 100
+    return p
+
+
+def _wynik(x: str | None) -> str | None:
+    """'1', '0', 'Z', '' (nierozliczony) albo None (nieczytelny)."""
+    w = (x or "").strip().upper()
+    if not w:
+        return ""
+    for kod, zbior in (("1", TRAFIONY), ("0", NIETRAFIONY), ("Z", ZWROT)):
+        if w in zbior:
+            return kod
+    return None
+
+
+def wczytaj(sciezka: str) -> list[dict]:
+    with open(sciezka, encoding="utf-8-sig", newline="") as fh:
+        naglowek = fh.readline()
+        sep = ";" if naglowek.count(";") > naglowek.count(",") else ","
+        fh.seek(0)
+        return list(csv.DictReader(fh, delimiter=sep))
+
+
 def rozlicz(wiersze: list[dict]) -> dict:
     n = 0
+    nieczytelne = 0
     brier = logloss = 0.0
     kosze: dict[int, list[float]] = {}
     stawki = zysk = 0.0
     clv = []
     for r in wiersze:
-        w = (r.get("wynik") or "").strip().upper()
-        p = _liczba(r.get("p_model"))
+        w = _wynik(r.get("wynik"))
+        p = _p(r.get("p_model"))
+        if w is None:
+            nieczytelne += 1
+            continue
         kurs, zamk = _liczba(r.get("kurs_wziety")), _liczba(r.get("kurs_zamkniecia"))
         stawka, podatek = _liczba(r.get("stawka")), _liczba(r.get("podatek")) or 0.88
         if kurs and zamk:
@@ -60,6 +97,7 @@ def rozlicz(wiersze: list[dict]) -> dict:
         "zysk": zysk,
         "clv": sum(clv) / len(clv) if clv else None,
         "n_clv": len(clv),
+        "nieczytelne": nieczytelne,
     }
 
 
@@ -67,8 +105,9 @@ def main(argv: list[str] | None = None) -> None:
     argv = sys.argv[1:] if argv is None else argv
     if not argv:
         sys.exit(__doc__)
-    with open(argv[0], encoding="utf-8") as fh:
-        w = rozlicz(list(csv.DictReader(fh)))
+    w = rozlicz(wczytaj(argv[0]))
+    if w["nieczytelne"]:
+        print(f"Pominięte wiersze z nieczytelnym wynikiem: {w['nieczytelne']} (użyj 1, 0 albo Z).")
     if not w["n"]:
         print("Brak rozliczonych typów.")
         return

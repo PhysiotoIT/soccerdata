@@ -1,6 +1,6 @@
 ---
 name: analityk-meczowy-v2
-description: Analiza meczu v2: dane z Sofascore przez skrypt, co najpewniej się wydarzy (gole, BTTS, rożne, kartki), ciekawostki i kupony AKO bez kursów; używaj przy analizie meczu lub typach.
+description: Analiza meczu v2, używaj zamiast analityk-meczowy: dane z Sofascore przez skrypt, co najpewniej się wydarzy (gole, BTTS, rożne, kartki), ciekawostki i kupony AKO bez kursów.
 ---
 
 # Analityk meczowy v2
@@ -17,14 +17,16 @@ Liczysz z danych, nie zgadujesz. Względem v1 zmieniają się trzy rzeczy:
 4. **Najpierw liczby, potem narracja.** Korekty jawne i z limitem, nie pod tezę.
 5. **Oceniaj proces, nie wynik.** Trafność mierzy kalibracja z logu, nie seria trafień.
 
-## Przygotowanie (raz na sesję)
+## Przygotowanie (raz na sesję, w jednym wywołaniu powłoki)
 ```bash
-F=~/soccerdata-fork
-git clone -q --depth 1 https://github.com/PhysiotoIT/soccerdata $F 2>/dev/null || git -C $F pull -q
-pip install -q --break-system-packages -e $F
-python3 $F/analityk/buduj_mecz.py --lista "Lech"     # test dostępu
+D=~/soccerdata-fork
+[ -d $D/.git ] || git clone -q --depth 1 https://github.com/PhysiotoIT/soccerdata $D
+git -C $D pull -q 2>/dev/null
+[ -f $D/analityk/buduj_mecz.py ] || { git -C $D fetch -q --depth 1 origin claude/ekstraklasa-analityk-v2 && git -C $D checkout -q FETCH_HEAD; }
+python3 -m pip install -q --break-system-packages -e $D
+python3 $D/analityk/buduj_mecz.py --lista "Lech"     # test dostępu
 ```
-Katalog `~/soccerdata` zostaw bibliotece (tam trzyma dane i konfigurację). Bibliotekę TLS potrzebną do zapytań skrypt dociąga sam.
+Zmienne powłoki nie przechodzą między wywołaniami — w kolejnych komendach pisz pełną ścieżkę `~/soccerdata-fork/analityk/...`. Katalog `~/soccerdata` zostaw bibliotece (tam trzyma dane i konfigurację). Bibliotekę TLS potrzebną do zapytań skrypt dociąga sam.
 
 **Gdy test kończy się komunikatem „Nie udało się pobrać danych z Sofascore”:** napisz użytkownikowi jednym zdaniem, że w sandboxie trzeba dodać `api.sofascore.com` do dozwolonych domen (Ustawienia > Capabilities) albo uruchomić skrypt na jego komputerze — i nie czekając, zrób analizę na danych zebranych ręcznie (sekcja „Ręcznie”). `model_meczowy.py` i `kalibracja.py` działają bez dostępu do Sofascore. Gdyby nie dało się sklonować repo, skrypt modelu jest w sekcji „Skrypt” skilla `analityk-meczowy`.
 
@@ -41,11 +43,12 @@ Rozgrywki, data i godzina (Europe/Warsaw), gospodarz i gość, stawka meczu (spa
 
 ### 2. Dane
 ```bash
-python3 $F/analityk/buduj_mecz.py "Gospodarz" "Gość" --wyjscie mecz.json
+python3 ~/soccerdata-fork/analityk/buduj_mecz.py "Gospodarz" "Gość" --wyjscie mecz.json
 ```
-- Dodaj `--poprzedni-sezon`, gdy któraś drużyna ma < 8 meczów u siebie / na wyjeździe (start sezonu, beniaminek) — skrypt napisze to w założeniach.
+- Nazwy mogą być skrócone i bez polskich znaków („Lech”, „Rakow”). Skrypt bierze najbliższy nierozegrany mecz tej pary w dowolnej kolejności i sam ustawia gospodarza.
+- Dodaj `--poprzedni-sezon`, gdy któraś drużyna ma < 8 meczów u siebie / na wyjeździe — skrypt napisze to w założeniach. Gdy w lidze rozegrano < 30 meczów (start sezonu), skrypt sam dołącza zeszły sezon: średnie ligi i współczynniki drużyn (beniaminek → 1.0).
 - Przeczytaj w `mecz.json`: `zalozenia`, `kontekst` (forma z xG, ciekawostki, dni odpoczynku, sędzia, absencje, współczynniki), `statystyki`.
-- Skrypt liczy λ tak jak v1: współczynniki ataku i obrony z xG i goli (70/30), sezon i ostatnie 6 meczów (60/40), dom i wyjazd osobno, ściąganie do średniej ligi (albo do zeszłego sezonu) wagą n/(n+6). xG z Sofascore zawiera karne.
+- Skrypt liczy λ jak v1: metryka na mecz = 70% xG + 30% gole, sezon i ostatnie 6 meczów (60/40), dom i wyjazd osobno, ściąganie do 1.0 (albo do zeszłego sezonu) wagą n/(n+6). Współczynnik = metryka drużyny / ta sama metryka średnio w lidze, λ = atak × obrona × średnia goli ligi. xG z Sofascore zawiera karne.
 
 Doszukaj w sieci tego, czego skrypt nie ma:
 - przewidywane składy, a ok. 60 min przed meczem oficjalne;
@@ -67,7 +70,7 @@ Użytkownik jest fizjoterapeutą — tu ma przewagę, więc pokaż przesłanki o
 - realne minuty po urazie (pierwszy mecz po dłuższej przerwie to często 15–45 min z ławki; po urazach mięśniowych ryzyko nawrotu jest najwyższe w pierwszych tygodniach po powrocie);
 - obciążenie: minuty z ostatnich 14 dni, 3 mecze w 7 dni, podróże, sztuczna murawa;
 - czy powrót do kadry oznacza pełną dyspozycję.
-Absencje z Sofascore (`kontekst.absencje`) to zapowiedź — potwierdź je w aktualnych źródłach. Przenieś wnioski na λ (krok 3) i na minuty w rynkach zawodników.
+Absencje z Sofascore (`kontekst.absencje`) to zapowiedź — potwierdź je w aktualnych źródłach; przy „kod Sofascore N” powód (uraz, kartki) sprawdź na stronie meczu. Przenieś wnioski na λ (krok 3) i na minuty w rynkach zawodników.
 
 ### 5. Rynki statystyczne i zawodnicy
 Skrypt wypełnia `statystyki`:
@@ -78,7 +81,7 @@ Skrypt wypełnia `statystyki`:
 
 ### 6. Model
 ```bash
-python3 $F/analityk/model_meczowy.py mecz.json
+python3 ~/soccerdata-fork/analityk/model_meczowy.py mecz.json
 ```
 Bez kursów skrypt pokazuje λ, najczęstsze wyniki i tabelę rynków po P: zakres P ze scenariuszy (±0.15 λ), % zwrotu, kurs fair. Kolumnę `min` pomiń — dotyczy value. Rynki spoza domyślnej tabeli dopisz w `"rynki": ["Wynik 2:1", "AH 1 -0.75", "1 & Over 1.5", "Gol w obu połowach"]` — trafią do tabeli P bez kursów. Klucze piszesz naturalnie (wielkość liter i polskie znaki bez znaczenia): `1`, `X2`, `DNB 1`, `Over 2.5`, `Under 3`, `Gosp. Over 1.5`, `Gość Under 0.5`, `BTTS tak`, `1 do zera`, `Czyste konto 2`, `Wynik 2:1`, `AH 2 +1.5`, `1. poł. Over 0.5`, `Rożne Over 9.5`, `Rożne 1 Over 5.5`, `Kartki Under 4.5`, `<zawodnik> Over 0.5`; kombinacje z jednego meczu łącz `&`. Opcjonalnie: `rho` (−0.10; typowo −0.05 do −0.15), `udzial_1pol` (0.45), `czulosc` (0.15).
 
@@ -118,28 +121,28 @@ Dopisz do `mecz.json`: `"kursy": {"BTTS tak": 1.75, …}`, opcjonalnie `"rynek":
 - Najbardziej prawdopodobne ≠ opłacalne: pokazuj to wprost.
 
 ## Rozliczenie (tryb D)
-Log: `data,mecz,rynek,p_model,kurs_wziety,kurs_zamkniecia,stawka,podatek,wynik` (wynik: 1, 0, Z = zwrot; puste = nierozliczony). Kursy i stawka mogą być puste. Log trzymaj tam, gdzie chce użytkownik (np. arkusz na Dysku Google, jeśli jest połączony).
+Log: `data,mecz,rynek,p_model,kurs_wziety,kurs_zamkniecia,stawka,podatek,wynik` (wynik: 1/tak, 0/nie, Z = zwrot; puste = nierozliczony; `p_model` jako 0.82 albo 82%; separator przecinek albo średnik). Kursy i stawka mogą być puste. Log trzymaj tam, gdzie chce użytkownik (np. arkusz na Dysku Google, jeśli jest połączony).
 ```bash
-python3 $F/analityk/kalibracja.py log.csv
+python3 ~/soccerdata-fork/analityk/kalibracja.py log.csv
 ```
 Wynik: Brier, log loss, kalibracja w przedziałach P (model vs trafione), a dla typów z kursem i stawką ROI i CLV. Gdy trafialność w przedziale P systematycznie odbiega od P modelu (od ok. 50 typów), popraw heurystyki z kroków 2–3.
 
 ## Ręcznie (bez dostępu do Sofascore)
-Te same wzory co skrypt:
+Te same wzory co skrypt; M = 0.7 × xG + 0.3 × gole na mecz, mieszane 60% sezon + 40% ostatnie 6 meczów:
 ```
-Atak_G = xG_G(dom) / śr_gole_gosp        Obrona_G = xGA_G(dom) / śr_gole_gości
-Atak_A = xG_A(wyjazd) / śr_gole_gości    Obrona_A = xGA_A(wyjazd) / śr_gole_gosp
+Atak_G = M_G(dom) / śr_M_gosp            Obrona_G = M_przeciw_G(dom) / śr_M_gości
+Atak_A = M_A(wyjazd) / śr_M_gości        Obrona_A = M_przeciw_A(wyjazd) / śr_M_gosp
 λ_G = Atak_G × Obrona_A × śr_gole_gosp   λ_A = Atak_A × Obrona_G × śr_gole_gości
 ```
-Miksuj 70% xG + 30% gole oraz 60% sezon + 40% ostatnie 6–8 meczów; współczynniki ściągaj do 1.0 wagą n/(n+6). Źródła (sprawdzaj dostępność): FotMob, SofaScore (przeglądarka), WhoScored, Flashscore, 90minut.pl, ekstraklasa.org, Transfermarkt (urazy, pauzy, sędziowie), FootyStats (rożne, kartki), clubelo.com. FBref od stycznia 2026 nie ma xG z Opty. Strony, których WebFetch nie renderuje, otwórz w przeglądarce albo poproś o screen. Gdy masz dane w tabeli, zapisz je w CSV (kolumny jak w `--eksport`) i użyj `buduj_mecz.py --z-csv`.
+śr_M i śr_gole to średnie całej ligi (gospodarze / goście). Współczynniki ściągaj do 1.0 wagą n/(n+6). Źródła (sprawdzaj dostępność): FotMob, SofaScore (przeglądarka), WhoScored, Flashscore, 90minut.pl, ekstraklasa.org, Transfermarkt (urazy, pauzy, sędziowie), FootyStats (rożne, kartki), clubelo.com. FBref od stycznia 2026 nie ma xG z Opty. Strony, których WebFetch nie renderuje, otwórz w przeglądarce albo poproś o screen. Gdy masz dane w tabeli, zapisz je w CSV i użyj `buduj_mecz.py --z-csv sezon.csv` (opcjonalnie `--data 2026-11-08T17:30 --sedzia-mecze 120 --sedzia-kartki 4.9` — oba parametry sędziego razem). CSV: wiersz na drużynę i mecz (każdy mecz = 2 wiersze), wymagane kolumny `date,team,opponent,venue,goals,goals_against` (`venue` = home/away), opcjonalnie `xg,xg_against,corners,corners_against,shots,shots_against,shots_on_target,shots_on_target_against,fouls,fouls_against,yellow_cards,yellow_cards_against,red_cards,red_cards_against`. CSV musi obejmować wszystkie mecze ligi, nie tylko dwóch drużyn — inaczej średnie ligi są fałszywe (skrypt ostrzeże).
 
 ## Inne sporty — szybkie modele
 - Hokej: model goli z `rho: 0`; pilnuj, czy rynek dotyczy 60 minut czy meczu z dogrywką.
-- Koszykówka: `python3 $F/analityk/model_meczowy.py --normal MU SIGMA LINIA` (NBA: σ różnicy ok. 12, σ sumy ok. 18 — skalibruj). W propsach kluczowe są minuty.
+- Koszykówka: `python3 ~/soccerdata-fork/analityk/model_meczowy.py --normal MU SIGMA LINIA` (NBA: σ różnicy ok. 12, σ sumy ok. 18 — skalibruj). W propsach kluczowe są minuty.
 
 ## Pułapki
 - „Ostatnie 5 meczów” bez xG to w dużej mierze szum; H2H sprzed lat ma wagę bliską zera.
 - Dni odpoczynku ze skryptu liczą tylko ligę; statystyki sędziego to kariera we wszystkich rozgrywkach.
 - Sofascore nie ma oficjalnego API i może zmienić format. Gdy w wielu meczach brakuje xG albo liczby wyglądają dziwnie (same zera, rożne 0), sprawdź jeden mecz ręcznie na sofascore.com, zanim im uwierzysz, i napisz o tym w raporcie.
-- Nie zasypuj Sofascore zapytaniami: dane są w pamięci podręcznej, ponowna analiza pobiera tylko nowe mecze.
+- Nie zasypuj Sofascore zapytaniami. Statystyki rozegranych meczów i zakończone kolejki trafiają do pamięci podręcznej (`~/soccerdata/data/Sofascore`), ale każde uruchomienie pobiera jeszcze bieżące kolejki i mecze z ostatnich 2 dni. W sandboxie pamięć podręczna znika z sesją, więc pierwsza analiza w sesji ściąga cały sezon (do ok. 300 meczów, 1–3 min). Analizuj mecz po meczu, bez pętli; gdy skrypt zgłosi serię błędów (blokada), przerwij i wróć później.
 - Najpierw liczby, potem narracja — nie dopasowuj korekt pod tezę.

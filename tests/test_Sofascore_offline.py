@@ -7,7 +7,10 @@ without network access.
 import io
 import json
 import math
+import os
+import time
 from collections.abc import Iterator
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -142,6 +145,18 @@ RESPONSES = {
         },
         "away": {"players": []},
     },
+    "event/5/lineups": {
+        "away": {
+            "missingPlayers": [
+                {
+                    "player": {"name": "Josue", "position": "M"},
+                    "type": "missing",
+                    "reason": 3,
+                    "expectedEndDateTimestamp": T0 + 420 * 86400,
+                }
+            ]
+        }
+    },
 }
 
 
@@ -253,3 +268,119 @@ def test_read_missing_players(ekstraklasa: sd.Sofascore) -> None:
     assert missing.iloc[0]["side"] == "home"
     assert missing.iloc[0]["description"] == "Hamstring injury"
     assert ekstraklasa.read_missing_players(3).empty
+    missing = ekstraklasa.read_missing_players(5)
+    assert missing.iloc[0]["side"] == "away"
+    assert missing.iloc[0]["reason"] == 3
+    assert str(missing.iloc[0]["expected_return"]) == "2026-09-18"
+
+
+# ---------- caching on disk (current season) ----------
+
+NOW = int(time.time())
+DAY = 86400
+ROUND = "unique-tournament/202/season/90001/events/round/{}"
+
+
+def _disk_responses() -> dict:
+    old = [
+        _event(11, "Lech Poznań", "Legia Warszawa", NOW - 10 * DAY, (2, 0), 1),
+        _event(14, "Raków Częstochowa", "Pogoń Szczecin", NOW - 9 * DAY, (1, 0), 1),
+        _event(15, "Pogoń Szczecin", "Lech Poznań", NOW - 8 * DAY, (0, 0), 1),
+        _event(16, "Legia Warszawa", "Raków Częstochowa", NOW - 7 * DAY, (3, 1), 1),
+    ]
+    recent = [
+        _event(12, "Legia Warszawa", "Lech Poznań", NOW - DAY, (1, 1), 2),
+        _event(13, "Raków Częstochowa", "Lech Poznań", NOW + 5 * DAY, None, 2),
+    ]
+    responses = {
+        "unique-tournament/202/seasons": {
+            "seasons": [{"year": "26/27", "id": 90001}, {"year": "25/26", "id": 76477}]
+        },
+        "unique-tournament/202/season/90001/rounds": {"rounds": [{"round": 1}, {"round": 2}]},
+        ROUND.format(1): {"events": old},
+        ROUND.format(2): {"events": recent},
+    }
+    for gid in (11, 12, 14, 15, 16):
+        responses[f"event/{gid}/statistics"] = STATS_GAME_1
+    return responses
+
+
+@pytest.fixture
+def ekstraklasa_disk(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> sd.Sofascore:
+    """Current-season reader with a real cache on disk; downloads come from a dict."""
+    monkeypatch.setattr(sd.Sofascore, "_init_session", lambda self, headers=None: None)
+    reader = sd.Sofascore("POL-Ekstraklasa", "26-27", data_dir=tmp_path)
+    reader.responses = _disk_responses()  # type: ignore[attr-defined]
+    reader.requested = []  # type: ignore[attr-defined]
+
+    def fake_download(url, filepath=None, var=None):
+        path = url[len(SOFASCORE_API) :]
+        reader.requested.append(path)  # type: ignore[attr-defined]
+        if path not in reader.responses:  # type: ignore[attr-defined]
+            raise ConnectionError(f"Could not download {url}.")
+        payload = json.dumps(reader.responses[path]).encode("utf-8")  # type: ignore[attr-defined]
+        if filepath is not None:
+            filepath.write_bytes(payload)
+        return io.BytesIO(payload)
+
+    monkeypatch.setattr(reader, "_download_and_save", fake_download)
+    return reader
+
+
+def test_stale_season_list_is_refreshed(ekstraklasa_disk: sd.Sofascore) -> None:
+    cached = ekstraklasa_disk.data_dir / "leagues" / "POL-Ekstraklasa.json"
+    cached.write_text(json.dumps({"seasons": [{"year": "25/26", "id": 76477}]}))
+    seasons = ekstraklasa_disk.read_seasons()
+    assert list(seasons.index) == [("POL-Ekstraklasa", "2627")]
+    assert ekstraklasa_disk.requested == ["unique-tournament/202/seasons"]  # type: ignore[attr-defined]
+    ekstraklasa_disk.requested.clear()  # type: ignore[attr-defined]
+    ekstraklasa_disk.read_seasons()
+    assert ekstraklasa_disk.requested == []  # type: ignore[attr-defined]
+
+
+def test_finished_rounds_are_cached(ekstraklasa_disk: sd.Sofascore) -> None:
+    ekstraklasa_disk.read_schedule()
+    ekstraklasa_disk.requested.clear()  # type: ignore[attr-defined]
+    schedule = ekstraklasa_disk.read_schedule()
+    assert len(schedule) == 6
+    requested = ekstraklasa_disk.requested  # type: ignore[attr-defined]
+    assert ROUND.format(1) not in requested  # all games ended more than two days ago
+    assert ROUND.format(2) in requested  # a recent and an upcoming game: may still change
+    assert "unique-tournament/202/season/90001/rounds" in requested
+
+
+def test_statistics_refreshed_until_settled(ekstraklasa_disk: sd.Sofascore) -> None:
+    schedule = ekstraklasa_disk.read_schedule()
+    requested = ekstraklasa_disk.requested  # type: ignore[attr-defined]
+    requested.clear()
+    stats = ekstraklasa_disk.read_team_match_stats(schedule=schedule)
+    assert len(stats) == 10
+    assert sorted(requested) == [f"event/{g}/statistics" for g in (11, 12, 14, 15, 16)]
+    # settled games come from the cache; the game from yesterday is downloaded again,
+    # and passing the schedule avoids downloading it a second time
+    requested.clear()
+    ekstraklasa_disk.read_team_match_stats(schedule=schedule)
+    assert requested == ["event/12/statistics"]
+    # statistics saved shortly after kick-off are downloaded again once they settled
+    saved = NOW - 10 * DAY + 3600
+    os.utime(ekstraklasa_disk.data_dir / "matches" / "statistics_11.json", (saved, saved))
+    requested.clear()
+    ekstraklasa_disk.read_team_match_stats(schedule=schedule)
+    assert sorted(requested) == ["event/11/statistics", "event/12/statistics"]
+
+
+def test_statistics_stop_after_failures(ekstraklasa_disk: sd.Sofascore) -> None:
+    schedule = ekstraklasa_disk.read_schedule()
+    ekstraklasa_disk.read_team_match_stats(schedule=schedule)  # everything cached
+    for gid in (12, 14, 15, 16):
+        ekstraklasa_disk.responses.pop(f"event/{gid}/statistics")  # type: ignore[attr-defined]
+    for gid in (14, 15, 16):  # pretend these were saved right after kick-off
+        (ekstraklasa_disk.data_dir / "matches" / f"statistics_{gid}.json").unlink()
+    requested = ekstraklasa_disk.requested  # type: ignore[attr-defined]
+    requested.clear()
+    stats = ekstraklasa_disk.read_team_match_stats(schedule=schedule)
+    # three failures in a row: game 12 is not requested, its cached statistics are used
+    assert requested == [f"event/{g}/statistics" for g in (14, 15, 16)]
+    by_game = stats.reset_index().set_index("game_id")
+    assert math.isnan(by_game.loc[14, "xg"].iloc[0])
+    assert sorted(by_game.loc[12, "xg"]) == [0.62, 1.84]

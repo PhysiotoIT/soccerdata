@@ -75,23 +75,88 @@ def test_dopasuj() -> None:
         bm.dopasuj("Barcelona", DRUZYNY)
 
 
+def test_dopasuj_cale_slowo_przed_poczatkiem() -> None:
+    z_lechia = [*DRUZYNY, "Lechia Gdańsk"]
+    assert bm.dopasuj("Lech", z_lechia) == "Lech Poznań"
+    assert bm.dopasuj("Lechia", z_lechia) == "Lechia Gdańsk"
+    assert bm.dopasuj("Lechi", z_lechia) == "Lechia Gdańsk"
+
+
 def test_sezony() -> None:
     assert bm.sezon_biezacy(datetime(2026, 11, 4, tzinfo=timezone.utc)) == "26-27"
     assert bm.sezon_biezacy(datetime(2027, 3, 1, tzinfo=timezone.utc)) == "26-27"
     assert bm.sezon_biezacy(datetime(2027, 7, 20, tzinfo=timezone.utc)) == "27-28"
     assert bm.sezon_poprzedni("26-27") == "25-26"
     assert bm.sezon_poprzedni("00-01") == "99-00"
+    for zapis in ("26-27", "2026-27", "2026/2027", "2627", "2026-2027"):
+        assert bm.normalizuj_sezon(zapis) == "26-27"
+    assert bm.sezon_poprzedni("2026-27") == "25-26"
+    with pytest.raises(ValueError, match="sezonu"):
+        bm.normalizuj_sezon("2026-28")
+
+
+def test_wybierz_mecz_najblizszy_w_dowolnej_kolejnosci() -> None:
+    teraz = datetime.now(tz=timezone.utc)
+    harm = pd.DataFrame(
+        [
+            {"home_team": "Lech Poznań", "away_team": "Legia Warszawa", "home_score": None,
+             "date": pd.Timestamp(teraz + timedelta(days=4)), "game_id": 1},
+            {"home_team": "Legia Warszawa", "away_team": "Lech Poznań", "home_score": None,
+             "date": pd.Timestamp(teraz + timedelta(days=150)), "game_id": 2},
+            {"home_team": "Legia Warszawa", "away_team": "Lech Poznań", "home_score": 1.0,
+             "date": pd.Timestamp(teraz - timedelta(days=60)), "game_id": 3},
+        ]
+    )  # fmt: skip
+    mecz, zal = bm.wybierz_mecz(harm, "Legia Warszawa", "Lech Poznań")
+    assert mecz["game_id"] == 1
+    assert any("Zamieniono" in z for z in zal)
+    mecz, zal = bm.wybierz_mecz(harm, "Lech Poznań", "Legia Warszawa")
+    assert (mecz["game_id"], zal) == (1, [])
+    with pytest.raises(ValueError, match="Brak nierozegranego"):
+        bm.wybierz_mecz(harm, "Lech Poznań", "Raków Częstochowa")
+
+
+def test_sedzia_bez_kartek_to_sedzia_nieznany() -> None:
+    sedzia, uwaga = bm.sedzia_z_szczegolow(
+        pd.Series({"referee": "Jan Kowalski", "referee_games": 50, "referee_yellow_cards": None})
+    )
+    assert sedzia["kartki_na_mecz"] is None and "brak statystyk" in uwaga
+    df = bm.przygotuj(liga_rowna())
+    stat, _ = bm.oblicz_statystyki(df, "Lech Poznań", "Legia Warszawa", sedzia)
+    assert stat["Kartki"]["suma"] == pytest.approx(4.0)  # same drużyny: 2 + 2
+    sedzia, uwaga = bm.sedzia_z_szczegolow(
+        pd.Series({"referee": "Jan Kowalski", "referee_games": 50, "referee_yellow_cards": 240,
+                   "referee_red_cards": float("nan")})
+    )  # fmt: skip
+    assert (sedzia["mecze"], sedzia["kartki_na_mecz"], uwaga) == (50, 4.8, None)
+    assert bm.sedzia_z_szczegolow(pd.Series({"referee": None}))[0] is None
+
+
+def test_poczatek_sezonu_srednie_z_zeszlego() -> None:
+    prev = bm.przygotuj(liga_rowna())
+    sr_prev = bm.srednie_ligi(prev)
+    pusty = prev.iloc[0:0]
+    with pytest.raises(ValueError, match="--poprzedni-sezon"):
+        bm.srednie_ligi(pusty)
+    lam = bm.oblicz_lambdy(pusty, "Lech Poznań", "Legia Warszawa", srednie_poprzednie=sr_prev)
+    assert (lam["lh"], lam["la"]) == (pytest.approx(1.0), pytest.approx(1.0))
+    assert lam["srednie_ligi"]["waga_sezonu"] == 0
+    # 30 meczów bieżących po 3 gole gospodarzy -> pół na pół z zeszłym sezonem
+    teraz = bm.przygotuj(liga_rowna()).assign(goals=3, goals_against=1)
+    teraz = teraz[teraz["game_id"] <= 30]
+    sr = bm.srednie_ligi(teraz, sr_prev)
+    assert sr["gole_gosp"] == pytest.approx(2.0)
 
 
 def test_rowna_liga_daje_srednie_ligi() -> None:
     df = bm.przygotuj(liga_rowna())
     lam = bm.oblicz_lambdy(df, "Lech Poznań", "Legia Warszawa")
-    # gospodarze: 0.7 * 1.3 + 0.3 * 1 = 1.21 przy średniej 1 gola -> współczynnik ataku > 1
+    # xG gospodarzy (1.3) jest wyższe niż gole (1.0), ale tak samo w całej lidze:
+    # współczynniki zostają 1.0, a λ = średnia goli ligi (bez skrzywienia xG vs gole)
     assert lam["srednie_ligi"]["gole_gosp"] == pytest.approx(1.0)
-    w = lam["wspolczynniki"]
-    assert w["atak_gosp"] == pytest.approx(1 + 0.21 * 5 / 11, abs=1e-3)
-    assert w["obrona_gosp"] == pytest.approx(1.0, abs=1e-3)  # 0.7*1.0 + 0.3*1 = 1.0
-    assert lam["lh"] == pytest.approx(w["atak_gosp"] * w["obrona_gosc"], abs=1e-3)
+    assert lam["srednie_ligi"]["metryka_gosp"] == pytest.approx(0.7 * 1.3 + 0.3)
+    assert all(v == pytest.approx(1.0, abs=1e-3) for v in lam["wspolczynniki"].values())
+    assert (lam["lh"], lam["la"]) == (pytest.approx(1.0, abs=1e-3), pytest.approx(1.0, abs=1e-3))
 
 
 def test_mocniejszy_atak_podnosi_lambde() -> None:
@@ -245,3 +310,63 @@ def test_kalibracja_bez_kursow(tmp_path: Path) -> None:
     assert w["roi"] == pytest.approx(0.88 * 2.10 - 1)
     assert w["clv"] == pytest.approx(2.10 / 2.00 - 1)
     kalibracja.main([str(log)])
+
+
+def test_kalibracja_polski_excel(tmp_path: Path) -> None:
+    import kalibracja
+
+    log = tmp_path / "log.csv"
+    log.write_text(
+        "data;mecz;rynek;p_model;kurs_wziety;kurs_zamkniecia;stawka;podatek;wynik\n"
+        "2026-11-01;A – B;Over 1.5;82%;;;;;tak\n"
+        "2026-11-01;A – B;BTTS tak;0,60;;;;;nie\n"
+        "2026-11-02;C – D;1;55;;;;;W\n"
+        "2026-11-02;C – D;Rożne Over 8.5;0.65;;;;;??\n",
+        encoding="utf-8",
+    )
+    w = kalibracja.rozlicz(kalibracja.wczytaj(str(log)))
+    assert (w["n"], w["nieczytelne"]) == (3, 1)
+    assert w["brier"] == pytest.approx((0.18**2 + 0.6**2 + 0.45**2) / 3)
+
+
+def test_csv_bez_game_id_i_ze_srednikami(tmp_path: Path) -> None:
+    df = bm.przygotuj(liga_rowna()).drop(columns=["game_id", "game", "league", "season"])
+    csv = tmp_path / "sezon.csv"
+    df.to_csv(csv, index=False, sep=";", decimal=",")
+    wyj = tmp_path / "mecz.json"
+    bm.main(["Lech", "Legia", "--z-csv", str(csv), "--wyjscie", str(wyj)])
+    wynik = json.loads(wyj.read_text(encoding="utf-8"))
+    assert wynik["model"]["lh"] == pytest.approx(1.0, abs=1e-3)
+    # tylko dwie drużyny w CSV -> ostrzeżenie o niepełnych średnich ligi
+    dwie = df[df["team"].isin(["Lech Poznań", "Legia Warszawa"])]
+    dwie[["date", "team", "opponent", "venue", "goals", "goals_against"]].to_csv(csv, index=False)
+    bm.main(["Lech", "Legia", "--z-csv", str(csv), "--wyjscie", str(wyj)])
+    wynik = json.loads(wyj.read_text(encoding="utf-8"))
+    assert any("niepełnych" in z for z in wynik["zalozenia"])
+    df.drop(columns=["venue"]).to_csv(csv, index=False)
+    with pytest.raises(SystemExit, match="venue"):
+        bm.main(["Lech", "Legia", "--z-csv", str(csv), "--wyjscie", str(wyj)])
+
+
+def test_cli_sedzia_tylko_razem(tmp_path: Path) -> None:
+    csv = tmp_path / "sezon.csv"
+    bm.przygotuj(liga_rowna()).to_csv(csv, index=False)
+    with pytest.raises(SystemExit):
+        bm.main(["Lech", "Legia", "--z-csv", str(csv), "--sedzia-kartki", "5.2"])
+    with pytest.raises(SystemExit, match="kilku"):
+        bm.main(["L", "Raków", "--z-csv", str(csv), "--wyjscie", str(tmp_path / "m.json")])
+
+
+def test_model_bez_powtorzen_rynkow(tmp_path: Path) -> None:
+    cfg = {"model": {"lh": 1.5, "la": 1.1}, "rynki": ["Over 2.5", "over 2.5", "BTTS tak"],
+           "kursy": {"BTTS tak": 1.8}}  # fmt: skip
+    plik = tmp_path / "m.json"
+    plik.write_text(json.dumps(cfg), encoding="utf-8")
+    out = subprocess.run(
+        [sys.executable, str(KATALOG / "model_meczowy.py"), str(plik)],
+        capture_output=True, text=True, check=True,
+    )  # fmt: skip
+    tabela_p = out.stdout.split("=== VALUE")[0]  # tabela P; sekcja value osobno
+    wiersze = [w.split()[0:2] for w in tabela_p.splitlines()]
+    assert sum(w == ["Over", "2.5"] for w in wiersze) == 1
+    assert sum(w == ["BTTS", "tak"] for w in wiersze) == 1

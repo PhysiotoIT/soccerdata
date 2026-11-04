@@ -44,6 +44,11 @@ STATISTICS_NAMES = {
 # Sofascore leaves these items out when both teams have zero of them.
 STATISTICS_ZERO_IF_MISSING = ("yellow_cards", "red_cards", "offsides")
 STATISTICS_COLUMNS = tuple(dict.fromkeys(STATISTICS_KEYS.values()))
+# Sofascore may still revise a game's statistics shortly after it ends.
+STATISTICS_SETTLED_AFTER = timedelta(days=2)
+# Stop downloading after this many failed games in a row (e.g. Sofascore blocks the IP).
+MAX_CONSECUTIVE_FAILURES = 3
+STATUS_ENDED = 100
 
 
 def _is_tournament_id(value: Any) -> bool:
@@ -143,6 +148,10 @@ class Sofascore(BaseRequestsReader):
             data_dir=data_dir,
         )
         self.seasons = seasons
+        # Sofascore has no official API and blocks clients that send many requests
+        # in a short time, so wait a little between downloads.
+        self.rate_limit = 0.3
+        self.max_delay = 0.3
         if not self.no_store:
             (self.data_dir / "leagues").mkdir(parents=True, exist_ok=True)
             (self.data_dir / "seasons").mkdir(parents=True, exist_ok=True)
@@ -191,8 +200,14 @@ class Sofascore(BaseRequestsReader):
         for lkey, league in df_leagues.iterrows():
             url = SOFASCORE_API + "unique-tournament/{}/seasons"
             filepath = self.data_dir / filemask.format(lkey)
+            was_cached = filepath.exists()
             reader = self.get(url.format(league.league_id), filepath)
             data = json.load(reader)["seasons"]
+            known = {self._season_code.parse(season["year"]) for season in data}
+            if was_cached and not set(self.seasons) <= known:
+                # The cached list predates a season that has started since.
+                reader = self.get(url.format(league.league_id), filepath, no_cache=True)
+                data = json.load(reader)["seasons"]
             for season in data:
                 seasons.append(
                     {
@@ -300,7 +315,10 @@ class Sofascore(BaseRequestsReader):
             for round in rounds:
                 filepath2 = self.data_dir / filemask2.format(lkey, skey, round["round"])
                 url2 = urlmask2.format(season["league_id"], season["season_id"], round["round"])
-                reader2 = self.get(url2, filepath2, no_cache=current_season and not force_cache)
+                refresh = (
+                    current_season and not force_cache and not self._round_is_final(filepath2)
+                )
+                reader2 = self.get(url2, filepath2, no_cache=refresh)
                 match_data = json.load(reader2)
                 for _match in match_data["events"]:
                     if _match["status"]["code"] == 100 or _match["status"]["code"] == 0:
@@ -337,17 +355,47 @@ class Sofascore(BaseRequestsReader):
         df["game"] = df.apply(make_game_id, axis=1)
         return df.set_index(["league", "season", "game"]).sort_index()[cols]
 
-    def read_team_match_stats(self, force_cache: bool = False) -> pd.DataFrame:
+    def _round_is_final(self, filepath: Path) -> bool:
+        """Whether a cached round only holds games that ended more than two days ago."""
+        if self.no_cache or not filepath.exists():
+            return False
+        try:
+            events = json.loads(filepath.read_bytes())["events"]
+            cutoff = datetime.now(tz=timezone.utc) - STATISTICS_SETTLED_AFTER
+            return bool(events) and all(
+                e["status"]["code"] == STATUS_ENDED
+                and datetime.fromtimestamp(e["startTimestamp"], tz=timezone.utc) < cutoff
+                for e in events
+            )
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+
+    @staticmethod
+    def _statistics_may_change(filepath: Path, kickoff: datetime) -> bool:
+        """Whether cached statistics were saved before they settled (or are missing)."""
+        if not filepath.exists():
+            return True
+        saved = datetime.fromtimestamp(filepath.stat().st_mtime, tz=timezone.utc)
+        return saved < kickoff + STATISTICS_SETTLED_AFTER
+
+    def read_team_match_stats(
+        self, force_cache: bool = False, schedule: pd.DataFrame | None = None
+    ) -> pd.DataFrame:
         """Retrieve match statistics (xG, corners, cards, shots, ...) per team and game.
 
-        Statistics are downloaded once per finished game and cached. Games that
-        finished less than two days ago are refreshed, since Sofascore may still
-        revise their statistics.
+        Statistics are downloaded once per finished game and cached. Statistics
+        saved less than two days after kick-off are downloaded again, since
+        Sofascore may still have been revising them. After several failed
+        downloads in a row (e.g. when Sofascore blocks the IP address), no more
+        downloads are attempted and the remaining games use cached data or NaN.
 
         Parameters
         ----------
         force_cache : bool
              Passed on to :meth:`read_schedule`.
+        schedule : pd.DataFrame, optional
+             The result of :meth:`read_schedule`, if it was already retrieved.
+             Saves downloading the schedule again.
 
         Returns
         -------
@@ -358,22 +406,40 @@ class Sofascore(BaseRequestsReader):
         """
         urlmask = SOFASCORE_API + "event/{}/statistics"
         filemask = "matches/statistics_{}.json"
-        schedule = self.read_schedule(force_cache=force_cache)
+        if schedule is None:
+            schedule = self.read_schedule(force_cache=force_cache)
         played = schedule[schedule["home_score"].notna()]
-        now = datetime.now(tz=timezone.utc)
 
         rows = []
+        failures = 0
         for (lkey, skey, game), match in played.iterrows():
             game_id = int(match["game_id"])
-            recent = (now - match["date"]) < timedelta(days=2)
-            try:
-                reader = self.get(
-                    urlmask.format(game_id),
-                    self.data_dir / filemask.format(game_id),
-                    no_cache=recent,
-                )
-                stats = parse_event_statistics(json.load(reader))
-            except (ConnectionError, ValueError, KeyError, TypeError):
+            url, filepath = urlmask.format(game_id), self.data_dir / filemask.format(game_id)
+            cached = filepath.exists()
+            stats = None
+            if failures < MAX_CONSECUTIVE_FAILURES and (
+                self.no_cache or self._statistics_may_change(filepath, match["date"])
+            ):
+                try:
+                    stats = parse_event_statistics(
+                        json.load(self.get(url, filepath, no_cache=True))
+                    )
+                    failures = 0
+                except ConnectionError:
+                    failures += 1
+                    if failures == MAX_CONSECUTIVE_FAILURES:
+                        logger.warning(
+                            "%d downloads failed in a row; using cached statistics only.",
+                            failures,
+                        )
+                except (ValueError, KeyError, TypeError):
+                    pass
+            if stats is None and cached:
+                try:
+                    stats = parse_event_statistics(json.loads(filepath.read_bytes()))
+                except (OSError, ValueError, KeyError, TypeError):
+                    stats = None
+            if stats is None:
                 logger.warning("No statistics available for game %s (%s).", game_id, game)
                 stats = {}
             for side, team, opponent, scored, conceded in (
@@ -489,7 +555,7 @@ class Sofascore(BaseRequestsReader):
         for side in ("home", "away"):
             for missing in (data.get(side) or {}).get("missingPlayers") or []:
                 player = missing.get("player") or {}
-                end = missing.get("expectedEndDate")
+                end = missing.get("expectedEndDateTimestamp", missing.get("expectedEndDate"))
                 rows.append(
                     {
                         "side": side,

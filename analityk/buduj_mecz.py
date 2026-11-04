@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import numbers
 import os
 import platform
 import re
@@ -41,12 +42,19 @@ STATY_STRON = {  # nazwa rynku w modelu -> kolumna danych
 VAR_RATIO_DOMYSLNE = {"corners": 1.15, "shots": 1.2, "shots_on_target": 1.2, "fouls": 1.15}
 VAR_RATIO_KARTKI = 1.25
 MIN_MECZOW_VAR = 30
+K_LIGI = 30  # średnie ligi ściągane do zeszłego sezonu wagą n / (n + K_LIGI)
+MIN_DRUZYN_CSV = 10
+KOLUMNY_WYMAGANE = ("date", "team", "opponent", "venue", "goals", "goals_against")
 BRAK_DOSTEPU = """Nie udało się pobrać danych z Sofascore ({blad}).
 Możliwe przyczyny i co zrobić:
 - sandbox Claude: dodaj api.sofascore.com do dozwolonych domen (Ustawienia > Capabilities)
   albo uruchom skrypt na swoim komputerze;
 - Sofascore blokuje adres IP (403): spróbuj później albo z innej sieci;
-- dane z innego miejsca: zapisz je w CSV i użyj --z-csv (kolumny jak w --eksport)."""
+- dane z innego miejsca: zapisz je w CSV i użyj --z-csv (kolumny w SKILL.md)."""
+
+
+class BladUzytkownika(ValueError):
+    """Błąd do pokazania użytkownikowi bez śladu stosu (zła nazwa, brak danych, zły sezon)."""
 
 
 # ---------- dopasowanie nazw ----------
@@ -59,47 +67,85 @@ def _tokeny(s: str) -> list[str]:
 
 
 def dopasuj(nazwa: str, druzyny: list[str]) -> str:
-    """Zwróć drużynę z listy pasującą do wpisanej nazwy ("lech", "Rakow", "Legia W.")."""
-    q = _tokeny(nazwa)
+    """Zwróć drużynę z listy pasującą do wpisanej nazwy ("lech", "Rakow", "Legia W.").
+
+    Kolejno: identyczna nazwa, wszystkie słowa jako całe słowa ("Lech" → Lech Poznań, nie
+    Lechia Gdańsk), wreszcie początki słów ("Rak" → Raków Częstochowa).
+    """
+    q = [x.rstrip(".") for x in _tokeny(nazwa)]
     if not q:
-        raise ValueError("Pusta nazwa drużyny.")
-    dokladne = [d for d in druzyny if _tokeny(d) == q]
-    if len(dokladne) == 1:
-        return dokladne[0]
-    kandydaci = [
-        d for d in druzyny if all(any(t.startswith(x.rstrip(".")) for t in _tokeny(d)) for x in q)
-    ]
-    if len(kandydaci) == 1:
-        return kandydaci[0]
-    if not kandydaci:
-        raise ValueError(
-            f"Nie znam drużyny „{nazwa}”. Drużyny w danych: {', '.join(sorted(druzyny))}"
-        )
-    raise ValueError(f"„{nazwa}” pasuje do kilku drużyn: {', '.join(sorted(kandydaci))}")
+        raise BladUzytkownika("Pusta nazwa drużyny.")
+    for pasuje in (
+        lambda t: t == q,
+        lambda t: all(x in t for x in q),
+        lambda t: all(any(s.startswith(x) for s in t) for x in q),
+    ):
+        kandydaci = [d for d in druzyny if pasuje(_tokeny(d))]
+        if len(kandydaci) == 1:
+            return kandydaci[0]
+        if kandydaci:
+            raise BladUzytkownika(
+                f"„{nazwa}” pasuje do kilku drużyn: {', '.join(sorted(kandydaci))}"
+            )
+    raise BladUzytkownika(
+        f"Nie znam drużyny „{nazwa}”. Drużyny w danych: {', '.join(sorted(druzyny))}"
+    )
 
 
 # ---------- dane ----------
 
 
 def przygotuj(df: pd.DataFrame) -> pd.DataFrame:
-    """Spłaszcz wynik Sofascore.read_team_match_stats (albo CSV z --eksport) i posortuj po dacie."""
+    """Spłaszcz wynik Sofascore.read_team_match_stats (albo CSV) i posortuj po dacie.
+
+    Wymagane kolumny: date, team, opponent, venue (home/away), goals, goals_against —
+    wiersz na drużynę i mecz. Reszta (xg, corners, yellow_cards, ... i ich *_against)
+    jest opcjonalna; brak xG oznacza liczenie z samych goli.
+    """
     df = df.reset_index() if "team" not in df.columns else df.copy()
+    brak = [k for k in KOLUMNY_WYMAGANE if k not in df.columns]
+    if brak:
+        raise BladUzytkownika(f"W danych brakuje kolumn: {', '.join(brak)}.")
     df["date"] = pd.to_datetime(df["date"], utc=True)
-    if "red_cards" in df.columns and "yellow_cards" in df.columns:
+    for kol in ("xg", "xg_against"):
+        if kol not in df.columns:
+            df[kol] = float("nan")
+    if {"yellow_cards", "red_cards", "yellow_cards_against", "red_cards_against"} <= set(df):
         df["cards"] = df["yellow_cards"] + df["red_cards"]
         df["cards_against"] = df["yellow_cards_against"] + df["red_cards_against"]
-    return df.sort_values(["date", "game_id"]).reset_index(drop=True)
+    klucz = ["date", "game_id"] if "game_id" in df.columns else ["date", "team"]
+    return df.sort_values(klucz).reset_index(drop=True)
 
 
-def srednie_ligi(df: pd.DataFrame) -> dict:
+def _metryka(w: pd.DataFrame, kol_xg: str, kol_gole: str) -> pd.Series:
+    """Na mecz: 0.7 × xG + 0.3 × gole (brak xG -> same gole)."""
+    return WAGA_XG * w[kol_xg].fillna(w[kol_gole]) + (1 - WAGA_XG) * w[kol_gole]
+
+
+def srednie_ligi(df: pd.DataFrame, poprzednie: dict | None = None) -> dict:
+    """Średnie ligi: gole (do λ) i ta sama metryka xG/gole co dla drużyn (do współczynników).
+
+    Z ``poprzednie`` (średnie zeszłego sezonu) wynik jest ściągany do nich wagą
+    n / (n + K_LIGI) — na starcie sezonu bieżące średnie to szum.
+    """
     dom = df[df["venue"] == "home"]
-    if dom.empty:
-        raise ValueError("Brak rozegranych meczów w danych — nie da się policzyć średnich ligi.")
-    return {
-        "gole_gosp": float(dom["goals"].mean()),
-        "gole_gosci": float(dom["goals_against"].mean()),
-        "mecze": len(dom),
-    }
+    n = len(dom)
+    if n == 0 and poprzednie is None:
+        raise BladUzytkownika("Brak rozegranych meczów w sezonie — uruchom z --poprzedni-sezon.")
+    klucze = ("gole_gosp", "gole_gosci", "metryka_gosp", "metryka_gosci")
+    biezace = dict.fromkeys(klucze, 0.0)
+    if n:
+        biezace = {
+            "gole_gosp": float(dom["goals"].mean()),
+            "gole_gosci": float(dom["goals_against"].mean()),
+            "metryka_gosp": float(_metryka(dom, "xg", "goals").mean()),
+            "metryka_gosci": float(_metryka(dom, "xg_against", "goals_against").mean()),
+        }
+    if poprzednie is None:
+        return {**biezace, "mecze": n}
+    w = n / (n + K_LIGI)
+    out = {k: w * biezace[k] + (1 - w) * poprzednie[k] for k in klucze}
+    return {**out, "mecze": n, "waga_sezonu": round(w, 2)}
 
 
 def _mieszaj(seria: pd.Series, n_forma: int) -> float:
@@ -112,10 +158,8 @@ def _mieszaj(seria: pd.Series, n_forma: int) -> float:
 
 def metryka_goli(wiersze: pd.DataFrame, kol_xg: str, kol_gole: str, n_forma: int) -> tuple:
     """Na mecz: 0.7 × xG + 0.3 × gole (brak xG -> same gole); potem sezon/forma 60/40."""
-    xg, gole = wiersze[kol_xg], wiersze[kol_gole]
-    braki = int(xg.isna().sum())
-    na_mecz = WAGA_XG * xg.fillna(gole) + (1 - WAGA_XG) * gole
-    return _mieszaj(na_mecz, n_forma), len(wiersze), braki
+    braki = int(wiersze[kol_xg].isna().sum())
+    return _mieszaj(_metryka(wiersze, kol_xg, kol_gole), n_forma), len(wiersze), braki
 
 
 def wspolczynnik(wartosc: float, srednia: float, n: int, prior: float = 1.0) -> float:
@@ -126,11 +170,15 @@ def wspolczynnik(wartosc: float, srednia: float, n: int, prior: float = 1.0) -> 
 
 
 def wspolczynniki_druzyny(df: pd.DataFrame, druzyna: str, n_forma: int, sr: dict) -> dict:
-    """Surowe składniki współczynników drużyny u siebie i na wyjeździe."""
+    """Surowe składniki współczynników drużyny u siebie i na wyjeździe.
+
+    sr_za / sr_przeciw to średnia ligi tej samej metryki (xG/gole 70/30), więc współczynnik
+    1.0 = poziom ligi, nawet gdy xG ligi różni się od liczby goli.
+    """
     out = {}
     for strona, sr_za, sr_przeciw in (
-        ("dom", sr["gole_gosp"], sr["gole_gosci"]),
-        ("wyjazd", sr["gole_gosci"], sr["gole_gosp"]),
+        ("dom", sr["metryka_gosp"], sr["metryka_gosci"]),
+        ("wyjazd", sr["metryka_gosci"], sr["metryka_gosp"]),
     ):
         w = df[(df["team"] == druzyna) & (df["venue"] == ("home" if strona == "dom" else "away"))]
         atak, n, braki_a = metryka_goli(w, "xg", "goals", n_forma)
@@ -166,33 +214,36 @@ def oblicz_lambdy(
     gosc: str,
     n_forma: int = 6,
     priory: dict | None = None,
+    srednie_poprzednie: dict | None = None,
 ) -> dict:
     """λ gospodarza i gościa według wzoru ze skilla + lista jawnych założeń."""
     priory = priory or {}
-    sr = srednie_ligi(df)
+    sr = srednie_ligi(df, srednie_poprzednie)
     g = wspolczynniki_druzyny(df, gosp, n_forma, sr)["dom"]
     a = wspolczynniki_druzyny(df, gosc, n_forma, sr)["wyjazd"]
     pg, pa = priory.get(gosp) or {}, priory.get(gosc) or {}
-    atak_g = wspolczynnik(g["atak"], sr["gole_gosp"], g["n"], pg.get("atak_dom", 1.0))
-    obrona_g = wspolczynnik(g["obrona"], sr["gole_gosci"], g["n"], pg.get("obrona_dom", 1.0))
-    atak_a = wspolczynnik(a["atak"], sr["gole_gosci"], a["n"], pa.get("atak_wyjazd", 1.0))
-    obrona_a = wspolczynnik(a["obrona"], sr["gole_gosp"], a["n"], pa.get("obrona_wyjazd", 1.0))
+    atak_g = wspolczynnik(g["atak"], g["sr_za"], g["n"], pg.get("atak_dom", 1.0))
+    obrona_g = wspolczynnik(g["obrona"], g["sr_przeciw"], g["n"], pg.get("obrona_dom", 1.0))
+    atak_a = wspolczynnik(a["atak"], a["sr_za"], a["n"], pa.get("atak_wyjazd", 1.0))
+    obrona_a = wspolczynnik(a["obrona"], a["sr_przeciw"], a["n"], pa.get("obrona_wyjazd", 1.0))
     lh = atak_g * obrona_a * sr["gole_gosp"]
     la = atak_a * obrona_g * sr["gole_gosci"]
 
+    skad = f"{sr['mecze']} meczów"
+    if "waga_sezonu" in sr:
+        skad += f", ściągnięte do zeszłego sezonu (waga bieżącego {sr['waga_sezonu']:.0%})"
     zal = [
         (
-            f"Średnie ligi z {sr['mecze']} meczów: gospodarze {sr['gole_gosp']:.2f}, "
+            f"Średnie ligi ({skad}): gospodarze {sr['gole_gosp']:.2f}, "
             f"goście {sr['gole_gosci']:.2f} gola na mecz."
         ),
+        "Współczynniki = metryka drużyny / ta sama metryka (xG/gole 70/30) średnio w lidze.",
         "xG z Sofascore zawiera karne — bez osobnej korekty na karne.",
     ]
     for druzyna, s, strona, p in ((gosp, g, "u siebie", pg), (gosc, a, "na wyjeździe", pa)):
         waga = s["n"] / (s["n"] + K_SCIAGANIA) if s["n"] else 0.0
-        cel = "współczynników z zeszłego sezonu" if p else "średniej ligi"
-        zal.append(
-            f"{druzyna} {strona}: {s['n']} meczów → waga danych {waga:.0%}, reszta z {cel}."
-        )
+        cel = "współczynniki z zeszłego sezonu" if p else "średnia ligi"
+        zal.append(f"{druzyna} {strona}: {s['n']} meczów → waga danych {waga:.0%}, reszta: {cel}.")
         if s["n"] < 8 and not p:
             zal.append(
                 f"{druzyna}: mała próba {strona} — rozważ --poprzedni-sezon i wyższy próg pewności."
@@ -379,12 +430,13 @@ def zbuduj(
     priory: dict | None = None,
     n_forma: int = 6,
     zrodla: list[dict] | None = None,
+    srednie_poprzednie: dict | None = None,
 ) -> dict:
     """Złóż mecz.json: wejście modelu + kontekst, ciekawostki, założenia i źródła."""
     df = przygotuj(df)
     if data_meczu is not None:
         df = df[df["date"] < data_meczu]  # tylko mecze rozegrane przed tym meczem
-    lam = oblicz_lambdy(df, gosp, gosc, n_forma, priory)
+    lam = oblicz_lambdy(df, gosp, gosc, n_forma, priory, srednie_poprzednie)
     stat, zal_stat = oblicz_statystyki(df, gosp, gosc, sedzia, n_forma)
     kiedy = data_meczu.astimezone(WARSZAWA).strftime("%d.%m %H:%M") if data_meczu else "termin ?"
     kontekst = {
@@ -426,8 +478,16 @@ def sezon_biezacy(teraz: datetime) -> str:
     return f"{rok:02d}-{(rok + 1) % 100:02d}"
 
 
+def normalizuj_sezon(sezon: str) -> str:
+    """'26-27', '2026-27', '2026/2027', '2627' -> '26-27'."""
+    m = re.fullmatch(r"(?:\d\d)?(\d\d)\s*[-/]?\s*(?:\d\d)?(\d\d)", sezon.strip())
+    if not m or (int(m.group(1)) + 1) % 100 != int(m.group(2)):
+        raise BladUzytkownika(f"Nie rozumiem sezonu „{sezon}” — podaj np. 26-27.")
+    return f"{m.group(1)}-{m.group(2)}"
+
+
 def sezon_poprzedni(sezon: str) -> str:
-    a = int(sezon[:2])
+    a = int(normalizuj_sezon(sezon)[:2])
     return f"{(a - 1) % 100:02d}-{a:02d}"
 
 
@@ -441,20 +501,68 @@ def _zapewnij_tls() -> None:
     try:
         TLSLibrary.load()
         return
-    except OSError:
+    except OSError as e:
         if platform.system() != "Linux" or platform.machine().lower() not in ("x86_64", "amd64"):
-            raise
+            raise BladUzytkownika(f"Nie udało się załadować biblioteki TLS ({e}).") from e
     wersja = LATEST_VERSION_TAG_NAME.lstrip("v")
     plik = f"tls-client-linux-ubuntu-amd64-{wersja}.so"
     url = f"https://github.com/bogdanfinn/tls-client/releases/download/v{wersja}/{plik}"
     print(f"Pobieram bibliotekę TLS: {url}", file=sys.stderr)
-    urllib.request.urlretrieve(url, os.path.join(BIN_DIR, plik))
-    TLSLibrary.load()
+    try:
+        urllib.request.urlretrieve(url, os.path.join(BIN_DIR, plik))
+        TLSLibrary.load()
+    except OSError as e:
+        raise BladUzytkownika(
+            f"Nie udało się pobrać biblioteki TLS z GitHuba ({e}). To nie jest problem z Sofascore:"
+            " sprawdź dostęp do github.com albo pobierz plik ręcznie do " + BIN_DIR
+        ) from e
 
 
-def _liczba(x: object) -> float:
-    """Wartość liczbowa albo 0 dla None/NaN (pola sędziego bywają puste)."""
-    return float(x) if x is not None and pd.notna(x) else 0.0
+def _jest_liczba(x: object) -> bool:
+    """Liczba (także numpy), ale nie bool, None ani NaN."""
+    return isinstance(x, numbers.Real) and not isinstance(x, bool) and not math.isnan(x)
+
+
+def sedzia_z_szczegolow(sz: pd.Series) -> tuple[dict | None, str | None]:
+    """Sędzia do mecz.json + ewentualne założenie. Brak statystyk kartek = sędzia nieznany
+    dla rynku kartek (nie zero kartek)."""
+    nazwisko = sz.get("referee")
+    if not isinstance(nazwisko, str) or not nazwisko:
+        return None, "Sędzia jeszcze nieznany — kartki liczone z samych drużyn."
+    mecze, zolte, czerwone = (
+        sz.get("referee_games"),
+        sz.get("referee_yellow_cards"),
+        sz.get("referee_red_cards"),
+    )
+    sedzia = {
+        "nazwisko": nazwisko,
+        "mecze": None,
+        "kartki_na_mecz": None,
+        "uwaga": "statystyki kariery z Sofascore (wszystkie rozgrywki)",
+    }
+    if not (_jest_liczba(mecze) and mecze > 0 and _jest_liczba(zolte)):
+        return sedzia, f"Sędzia {nazwisko}: brak statystyk kartek — kartki z samych drużyn."
+    kartki = zolte + (czerwone if _jest_liczba(czerwone) else 0)
+    sedzia.update(mecze=int(mecze), kartki_na_mecz=round(kartki / mecze, 2))
+    return sedzia, None
+
+
+def wybierz_mecz(harm: pd.DataFrame, gosp: str, gosc: str) -> tuple[pd.Series, list[str]]:
+    """Najbliższy nierozegrany mecz tych drużyn w dowolnej kolejności + założenia."""
+    para = ((harm["home_team"] == gosp) & (harm["away_team"] == gosc)) | (
+        (harm["home_team"] == gosc) & (harm["away_team"] == gosp)
+    )
+    przyszle = harm[para & harm["home_score"].isna()].sort_values("date")
+    if przyszle.empty:
+        raise BladUzytkownika(f"Brak nierozegranego meczu {gosp} – {gosc} w tym sezonie.")
+    mecz = przyszle.iloc[0]
+    zal = []
+    if mecz["home_team"] != gosp:
+        zal.append(f"Zamieniono kolejność: najbliższy mecz to {gosc} (dom) – {gosp}.")
+    dni = (mecz["date"] - datetime.now(tz=timezone.utc)).days
+    if dni > 10:
+        zal.append(f"Mecz jest dopiero za {dni} dni — forma i składy mogą się zmienić.")
+    return mecz, zal
 
 
 def _absencje_tekst(df: pd.DataFrame, gosp: str, gosc: str) -> list[str]:
@@ -462,7 +570,12 @@ def _absencje_tekst(df: pd.DataFrame, gosp: str, gosc: str) -> list[str]:
     for _, r in df.iterrows():
         druzyna = gosp if r["side"] == "home" else gosc
         powrot = f", powrót ~{r['expected_return']}" if pd.notna(r["expected_return"]) else ""
-        opis = r["description"] if pd.notna(r["description"]) else "bez opisu"
+        if pd.notna(r["description"]) and r["description"]:
+            opis = r["description"]
+        elif pd.notna(r["reason"]):
+            opis = f"powód: kod Sofascore {r['reason']} — sprawdź na stronie meczu"
+        else:
+            opis = "bez opisu"
         out.append(f"{druzyna}: {r['player']} ({r['position']}) — {opis}{powrot} [{r['type']}]")
     return out
 
@@ -474,50 +587,41 @@ def pobierz(args: argparse.Namespace) -> tuple[pd.DataFrame, dict]:
     teraz = datetime.now(tz=timezone.utc)
     sezon = args.sezon or sezon_biezacy(teraz)
     rd = sd.Sofascore(args.liga, sezon)
-    harm = rd.read_schedule().reset_index()
+    terminarz = rd.read_schedule()
+    harm = terminarz.reset_index()
     druzyny = sorted(set(harm["home_team"]) | set(harm["away_team"]))
-    gosp, gosc = dopasuj(args.gospodarz, druzyny), dopasuj(args.gosc, druzyny)
-    zalozenia = []
+    mecz, zalozenia = wybierz_mecz(
+        harm, dopasuj(args.gospodarz, druzyny), dopasuj(args.gosc, druzyny)
+    )
+    gosp, gosc, game_id = mecz["home_team"], mecz["away_team"], int(mecz["game_id"])
 
-    def nierozegrane(h: str, a: str) -> pd.DataFrame:
-        m = (harm["home_team"] == h) & (harm["away_team"] == a) & harm["home_score"].isna()
-        return harm[m].sort_values("date")
-
-    przyszle = nierozegrane(gosp, gosc)
-    if przyszle.empty and not nierozegrane(gosc, gosp).empty:
-        gosp, gosc = gosc, gosp
-        przyszle = nierozegrane(gosp, gosc)
-        zalozenia.append(f"Zamieniono kolejność: gospodarzem jest {gosp}.")
-    if przyszle.empty:
-        raise SystemExit(f"Brak nierozegranego meczu {gosp} – {gosc} w sezonie {sezon}.")
-    mecz = przyszle.iloc[0]
-    game_id = int(mecz["game_id"])
-
-    staty = rd.read_team_match_stats()
-    szczegoly = rd.read_event_details(game_id).iloc[0]
-    sedzia = None
-    if pd.notna(szczegoly.get("referee")) and szczegoly.get("referee"):
-        mecze = int(_liczba(szczegoly.get("referee_games")))
-        kartki = _liczba(szczegoly.get("referee_yellow_cards")) + _liczba(
-            szczegoly.get("referee_red_cards")
-        )
-        sedzia = {
-            "nazwisko": szczegoly["referee"],
-            "mecze": mecze,
-            "kartki_na_mecz": round(kartki / mecze, 2) if mecze else None,
-            "uwaga": "statystyki kariery z Sofascore (wszystkie rozgrywki)",
-        }
-    else:
-        zalozenia.append("Sędzia jeszcze nieznany — kartki liczone z samych drużyn.")
+    # terminarz już jest — read_team_match_stats nie pobiera go drugi raz
+    staty = rd.read_team_match_stats(schedule=terminarz)
+    sedzia, uwaga = sedzia_z_szczegolow(rd.read_event_details(game_id).iloc[0])
+    if uwaga:
+        zalozenia.append(uwaga)
     absencje = _absencje_tekst(rd.read_missing_players(game_id), gosp, gosc)
 
-    priory = None
+    priory = srednie_poprzednie = None
+    rozegrane = int(harm["home_score"].notna().sum())
+    if not args.poprzedni_sezon and rozegrane < K_LIGI:
+        args.poprzedni_sezon = True
+        zalozenia.append(
+            f"Rozegrane mecze w sezonie: {rozegrane} — dołączony zeszły sezon (prior)."
+        )
     if args.poprzedni_sezon:
-        prev = przygotuj(sd.Sofascore(args.liga, sezon_poprzedni(sezon)).read_team_match_stats())
-        priory = {d: prior_z_sezonu(prev, d, args.forma) for d in (gosp, gosc)}
-        for d, p in priory.items():
-            if p is None:
-                zalozenia.append(f"{d}: brak w poprzednim sezonie ligi (beniaminek?) — prior 1.0.")
+        poprzedni = sezon_poprzedni(sezon)
+        try:
+            prev = przygotuj(sd.Sofascore(args.liga, poprzedni).read_team_match_stats())
+        except (KeyError, ValueError, ConnectionError) as e:
+            prev = None
+            zalozenia.append(f"Nie udało się pobrać sezonu {poprzedni} ({e}) — bez priora.")
+        if prev is not None and not prev.empty:
+            srednie_poprzednie = srednie_ligi(prev)
+            priory = {d: prior_z_sezonu(prev, d, args.forma) for d in (gosp, gosc)}
+            for d, p in priory.items():
+                if p is None:
+                    zalozenia.append(f"{d}: brak w sezonie {poprzedni} (beniaminek?) — prior 1.0.")
 
     pobrano = teraz.astimezone(WARSZAWA).strftime("%Y-%m-%d %H:%M")
     zrodla = [
@@ -531,6 +635,7 @@ def pobierz(args: argparse.Namespace) -> tuple[pd.DataFrame, dict]:
         "sedzia": sedzia,
         "absencje": absencje,
         "priory": priory,
+        "srednie_poprzednie": srednie_poprzednie,
         "zrodla": zrodla,
         "zalozenia": zalozenia,
     }
@@ -552,6 +657,42 @@ def lista_meczow(args: argparse.Namespace) -> None:
         print(f"{kiedy}  {r['home_team']} – {r['away_team']}  (game_id {r['game_id']})")
 
 
+def z_csv(args: argparse.Namespace) -> tuple[pd.DataFrame, dict]:
+    with open(args.z_csv, encoding="utf-8") as fh:
+        sep = ";" if fh.readline().count(";") > 1 else ","  # polski Excel zapisuje ze średnikami
+    staty = przygotuj(pd.read_csv(args.z_csv, sep=sep, decimal="," if sep == ";" else "."))
+    druzyny = sorted(set(staty["team"]))
+    zalozenia = []
+    if len(druzyny) < MIN_DRUZYN_CSV:
+        zalozenia.append(
+            f"CSV ma tylko {len(druzyny)} drużyn — średnie ligi z niepełnych danych, λ mniej"
+            " pewne. Do rzetelnych liczb CSV powinien mieć wszystkie mecze ligi."
+        )
+    data = None
+    if args.data:
+        data = datetime.fromisoformat(args.data)
+        data = data.replace(tzinfo=WARSZAWA) if data.tzinfo is None else data
+    sedzia = None
+    if args.sedzia_kartki is not None:
+        sedzia = {
+            "nazwisko": "?",
+            "mecze": args.sedzia_mecze,
+            "kartki_na_mecz": args.sedzia_kartki,
+        }
+    meta = {
+        "gosp": dopasuj(args.gospodarz, druzyny),
+        "gosc": dopasuj(args.gosc, druzyny),
+        "data": data,
+        "sedzia": sedzia,
+        "absencje": None,
+        "priory": None,
+        "srednie_poprzednie": None,
+        "zrodla": [{"zrodlo": f"CSV {os.path.basename(args.z_csv)}"}],
+        "zalozenia": zalozenia,
+    }
+    return staty, meta
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     p.add_argument("gospodarz", nargs="?")
@@ -563,65 +704,42 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--poprzedni-sezon", action="store_true", help="prior z zeszłego sezonu")
     p.add_argument("--lista", metavar="DRUŻYNA", help="pokaż najbliższe mecze drużyny")
     p.add_argument("--eksport", metavar="CSV", help="zapisz statystyki sezonu do CSV")
-    p.add_argument("--z-csv", metavar="CSV", help="licz z CSV (z --eksport), bez pobierania")
+    p.add_argument("--z-csv", metavar="CSV", help="licz z CSV, bez pobierania")
     p.add_argument("--data", help="przy --z-csv: termin meczu, np. 2026-11-08T17:30")
     p.add_argument("--sedzia-mecze", type=int, help="przy --z-csv: mecze sędziego")
     p.add_argument("--sedzia-kartki", type=float, help="przy --z-csv: kartki sędziego na mecz")
     args = p.parse_args(argv)
-
-    if args.lista:
-        try:
-            lista_meczow(args)
-        except (ConnectionError, OSError) as e:
-            raise SystemExit(BRAK_DOSTEPU.format(blad=e)) from None
-        return
-    if not (args.gospodarz and args.gosc):
+    if (args.sedzia_mecze is None) != (args.sedzia_kartki is None):
+        p.error("--sedzia-mecze i --sedzia-kartki podaj razem")
+    if not args.lista and not (args.gospodarz and args.gosc):
         p.error("podaj gospodarza i gościa (albo --lista DRUŻYNA)")
 
-    if args.z_csv:
-        staty = pd.read_csv(args.z_csv)
-        druzyny = sorted(set(staty["team"]))
-        data = None
-        if args.data:
-            data = datetime.fromisoformat(args.data)
-            data = data.replace(tzinfo=WARSZAWA) if data.tzinfo is None else data
-        sedzia = None
-        if args.sedzia_kartki is not None:
-            sedzia = {
-                "nazwisko": "?",
-                "mecze": args.sedzia_mecze or 0,
-                "kartki_na_mecz": args.sedzia_kartki,
-            }
-        meta = {
-            "gosp": dopasuj(args.gospodarz, druzyny),
-            "gosc": dopasuj(args.gosc, druzyny),
-            "data": data,
-            "sedzia": sedzia,
-            "absencje": None,
-            "priory": None,
-            "zrodla": [{"zrodlo": f"CSV {os.path.basename(args.z_csv)}"}],
-            "zalozenia": [],
-        }
-    else:
-        try:
-            staty, meta = pobierz(args)
-        except (ConnectionError, OSError) as e:
-            raise SystemExit(BRAK_DOSTEPU.format(blad=e)) from None
-    if args.eksport:
-        przygotuj(staty).to_csv(args.eksport, index=False)
-
-    wynik = zbuduj(
-        staty,
-        meta["gosp"],
-        meta["gosc"],
-        args.liga,
-        data_meczu=meta["data"],
-        sedzia=meta["sedzia"],
-        absencje=meta["absencje"],
-        priory=meta["priory"],
-        n_forma=args.forma,
-        zrodla=meta["zrodla"],
-    )
+    try:
+        if args.sezon:
+            args.sezon = normalizuj_sezon(args.sezon)
+        if args.lista:
+            lista_meczow(args)
+            return
+        staty, meta = z_csv(args) if args.z_csv else pobierz(args)
+        if args.eksport:
+            przygotuj(staty).to_csv(args.eksport, index=False)
+        wynik = zbuduj(
+            staty,
+            meta["gosp"],
+            meta["gosc"],
+            args.liga,
+            data_meczu=meta["data"],
+            sedzia=meta["sedzia"],
+            absencje=meta["absencje"],
+            priory=meta["priory"],
+            n_forma=args.forma,
+            zrodla=meta["zrodla"],
+            srednie_poprzednie=meta["srednie_poprzednie"],
+        )
+    except BladUzytkownika as e:
+        raise SystemExit(str(e)) from None
+    except (ConnectionError, OSError) as e:
+        raise SystemExit(BRAK_DOSTEPU.format(blad=e)) from None
     wynik["zalozenia"] = meta["zalozenia"] + wynik["zalozenia"]
     with open(args.wyjscie, "w", encoding="utf-8") as fh:
         json.dump(wynik, fh, ensure_ascii=False, indent=1, default=str)
